@@ -1,15 +1,33 @@
-"""NTE news aggregator -> Telegram chat. Free: runs on GitHub Actions."""
+"""NTE news aggregator -> Telegram chat. Free.
+
+Два режима (переменная GROUP):
+  cloud - Telegram-каналы + YouTube (запускается на GitHub Actions)
+  local - Twitter + Bilibili + Weibo (запускается на твоём компьютере)
+  all   - всё сразу
+"""
 import os, json, html, time
 import requests, feedparser
 from bs4 import BeautifulSoup
 
+# Настройки из файла local.env (для запуска на компьютере). Секреты GitHub имеют приоритет.
+if os.path.exists("local.env"):
+    for _line in open("local.env", encoding="utf-8"):
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+
 TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
-STATE_FILE = "state.json"
-UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
+GROUP = os.environ.get("GROUP", "all")
+STATE_FILE = os.environ.get("STATE_FILE", "state.json")
+BILI_COOKIE = os.environ.get("BILI_COOKIE", "")
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
+MOBILE_UA = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1"}
 
 # ---- Разделение по темам (топикам) супергруппы. -------------------------
 # Узнай message_thread_id каждого топика и впиши сюда. None = писать в общий чат.
+# ВАЖНО: если меняешь, меняй и на GitHub (bot.py), и на компьютере.
 TOPICS = {
     "twitter": None,
     "youtube": None,
@@ -20,25 +38,22 @@ TOPICS = {
 }
 
 # ---- Источники ----------------------------------------------------------
-NITTER = []  # зеркала Nitter мертвы, оставлено на случай если появятся живые
-RSSHUB = ["http://localhost:1200", "https://rsshub.app", "https://rsshub.rssforever.com"]  # localhost = свой RSSHub, поднимается в workflow
+RSSHUB = ["http://localhost:1200"]  # запасной путь, если на компьютере стоит свой RSSHub
 
 SOURCES = []
 for u in ["NTE_GL", "Nteupdates", "nte_update"]:
-    SOURCES.append({"name": f"X @{u}", "topic": "twitter", "type": "x", "user": u,
-                    "urls": [f"{h}/{u}/rss" for h in NITTER]})  # urls = запасной путь через Nitter
+    SOURCES.append({"name": f"X @{u}", "topic": "twitter", "type": "x", "user": u})
 
 SOURCES.append({"name": "YouTube", "topic": "youtube", "type": "rss",
                 "urls": ["https://www.youtube.com/feeds/videos.xml?channel_id=UCIc-uir_VVR8D2RlUyP29Aw"]})
 
-SOURCES.append({"name": "Bilibili", "topic": "bilibili", "type": "rss",
-                "urls": [f"{h}/bilibili/user/dynamic/3546636978489848" for h in RSSHUB]})
+BILI_UID = "3546636978489848"
+SOURCES.append({"name": "Bilibili", "topic": "bilibili", "type": "bili", "uid": BILI_UID,
+                "urls": [f"{h}/bilibili/user/dynamic/{BILI_UID}" for h in RSSHUB]})
 
-# WEIBO_UID — числовой ID официального аккаунта (см. инструкцию). Пока пусто — источник пропускается.
 WEIBO_UID = "7929584207"
-if WEIBO_UID:
-    SOURCES.append({"name": "Weibo", "topic": "weibo", "type": "rss",
-                    "urls": [f"{h}/weibo/user/{WEIBO_UID}" for h in RSSHUB]})
+SOURCES.append({"name": "Weibo", "topic": "weibo", "type": "weibo", "uid": WEIBO_UID,
+                "urls": [f"{h}/weibo/user/{WEIBO_UID}" for h in RSSHUB]})
 
 TG_CHANNELS = ["NTEanabioz", "NTE_Pokoii", "NTEDARK", "Info_Neverness_to_Everness",
                "Neverness_to_EvernessRU", "kvashnya5", "MIU_VERSE", "Neverness_to_Everness_RU",
@@ -49,6 +64,14 @@ for c in TG_CHANNELS:
     SOURCES.append({"name": f"TG {c}", "topic": "telegram", "type": "tg", "channel": c})
 for c in TG_LEAKS:
     SOURCES.append({"name": f"Слив {c}", "topic": "leaks", "type": "tg", "channel": c})
+
+
+def group_of(src):
+    return "local" if src["type"] in ("x", "bili", "weibo") else "cloud"
+
+
+if GROUP != "all":
+    SOURCES = [s for s in SOURCES if group_of(s) == GROUP]
 
 
 # ---- Загрузчики (возвращают посты от старых к новым) --------------------
@@ -93,8 +116,8 @@ def fetch_rss(src):
     raise RuntimeError("все зеркала не ответили -> " + " | ".join(errors))
 
 
+# --- Twitter / X ---
 def parse_x_html(html_text):
-    """Достаёт твиты из встроенной ленты профиля (__NEXT_DATA__)."""
     soup = BeautifulSoup(html_text, "html.parser")
     tag = soup.find("script", id="__NEXT_DATA__")
     if not tag:
@@ -111,7 +134,7 @@ def parse_x_html(html_text):
         text = t.get("full_text") or t.get("text") or ""
         posts.append({"id": tid, "text": html.unescape(text).strip(),
                       "url": f"https://x.com/{screen}/status/{tid}"})
-    posts.sort(key=lambda p: int(p["id"]))  # старые -> новые
+    posts.sort(key=lambda p: int(p["id"]))
     return posts
 
 
@@ -121,7 +144,7 @@ def fetch_x(src):
         try:
             url = f"https://{host}/srv/timeline-profile/screen-name/{src['user']}"
             r = requests.get(url, headers=UA, timeout=25)
-            if r.status_code == 429:  # лимит запросов: ждём и пробуем один раз ещё
+            if r.status_code == 429:
                 time.sleep(15)
                 r = requests.get(url, headers=UA, timeout=25)
             r.raise_for_status()
@@ -131,12 +154,86 @@ def fetch_x(src):
             last_err = f"{host}: лента пуста"
         except Exception as ex:
             last_err = ex
-    if not src.get("urls"):
-        raise RuntimeError(f"Twitter недоступен ({last_err}). Следующая попытка при следующем запуске")
-    try:  # запасной путь: Nitter
+    raise RuntimeError(f"Twitter недоступен ({last_err})")
+
+
+# --- Bilibili ---
+def parse_bili(j):
+    posts = []
+    for it in j["data"]["items"]:
+        mod = (it.get("modules") or {}).get("module_dynamic") or {}
+        text = ((mod.get("desc") or {}).get("text") or "").strip()
+        major = mod.get("major") or {}
+        for key in ("archive", "opus", "article"):
+            if key in major:
+                title = (major[key].get("title") or "").strip()
+                if title and title not in text:
+                    text = f"{title}\n{text}".strip()
+        did = it.get("id_str")
+        if did:
+            posts.append({"id": did, "text": text or "(новая запись)", "url": f"https://t.bilibili.com/{did}"})
+    posts.sort(key=lambda p: int(p["id"]))
+    return posts
+
+
+def fetch_bili(src):
+    headers = dict(UA, Referer="https://space.bilibili.com/")
+    if BILI_COOKIE:
+        headers["Cookie"] = BILI_COOKIE
+    err = None
+    try:
+        r = requests.get("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
+                         params={"host_mid": src["uid"]}, headers=headers, timeout=25)
+        j = r.json()
+        if j.get("code") == 0:
+            return parse_bili(j)
+        err = f"Bilibili API: код {j.get('code')}, {j.get('message')}"
+    except Exception as ex:
+        err = f"Bilibili API: {str(ex)[:120]}"
+    try:
         return fetch_rss(src)
     except Exception as ex:
-        raise RuntimeError(f"Twitter недоступен ({last_err}; {ex})")
+        raise RuntimeError(f"{err} | RSSHub: {str(ex)[:150]}")
+
+
+# --- Weibo ---
+def parse_weibo(j):
+    posts = []
+    for card in j["data"]["cards"]:
+        mb = card.get("mblog")
+        if not mb:
+            continue
+        text = BeautifulSoup(mb.get("text", ""), "html.parser").get_text(" ", strip=True)
+        posts.append({"id": str(mb["id"]), "text": text or "(новая запись)",
+                      "url": f"https://m.weibo.cn/detail/{mb['id']}"})
+    posts.sort(key=lambda p: int(p["id"]))
+    return posts
+
+
+def fetch_weibo(src):
+    uid = src["uid"]
+    err = None
+    try:
+        r = requests.get("https://m.weibo.cn/api/container/getIndex",
+                         params={"type": "uid", "value": uid, "containerid": f"107603{uid}"},
+                         headers=dict(MOBILE_UA, Referer=f"https://m.weibo.cn/u/{uid}"), timeout=25)
+        j = r.json()
+        if j.get("ok") == 1:
+            posts = parse_weibo(j)
+            if posts:
+                return posts
+            err = "Weibo API: записей нет"
+        else:
+            err = f"Weibo API: ok={j.get('ok')}, {j.get('msg', '')}"
+    except Exception as ex:
+        err = f"Weibo API: {str(ex)[:120]}"
+    try:
+        return fetch_rss(src)
+    except Exception as ex:
+        raise RuntimeError(f"{err} | RSSHub: {str(ex)[:150]}")
+
+
+FETCHERS = {"tg": fetch_tg, "x": fetch_x, "bili": fetch_bili, "weibo": fetch_weibo, "rss": fetch_rss}
 
 
 def send(topic_key, name, post):
@@ -152,7 +249,7 @@ def send(topic_key, name, post):
 
 def main():
     try:
-        state = json.load(open(STATE_FILE))
+        state = json.load(open(STATE_FILE, encoding="utf-8"))
     except Exception:
         state = {}
 
@@ -161,7 +258,7 @@ def main():
         try:
             if src["type"] == "x":
                 time.sleep(5)
-            posts = {"tg": fetch_tg, "x": fetch_x}.get(src["type"], fetch_rss)(src)
+            posts = FETCHERS[src["type"]](src)
         except Exception as ex:
             print(f"[{name}] ошибка: {ex}")
             continue
@@ -176,7 +273,7 @@ def main():
                 seen.append(p["id"])
         state[name] = seen[-100:]
 
-    json.dump(state, open(STATE_FILE, "w"), ensure_ascii=False, indent=1)
+    json.dump(state, open(STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 
 
 if __name__ == "__main__":
