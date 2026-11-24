@@ -21,12 +21,12 @@ TOPICS = {
 
 # ---- Источники ----------------------------------------------------------
 NITTER = ["https://nitter.net", "https://nitter.poast.org", "https://nitter.privacydev.net"]
-RSSHUB = ["https://rsshub.app", "https://rsshub.rssforever.com"]
+RSSHUB = ["http://localhost:1200", "https://rsshub.app", "https://rsshub.rssforever.com"]  # localhost = свой RSSHub, поднимается в workflow
 
 SOURCES = []
 for u in ["NTE_GL", "Nteupdates", "nte_update"]:
-    SOURCES.append({"name": f"X @{u}", "topic": "twitter", "type": "rss",
-                    "urls": [f"{h}/{u}/rss" for h in NITTER]})
+    SOURCES.append({"name": f"X @{u}", "topic": "twitter", "type": "x", "user": u,
+                    "urls": [f"{h}/{u}/rss" for h in NITTER]})  # urls = запасной путь через Nitter
 
 SOURCES.append({"name": "YouTube", "topic": "youtube", "type": "rss",
                 "urls": ["https://www.youtube.com/feeds/videos.xml?channel_id=UCIc-uir_VVR8D2RlUyP29Aw"]})
@@ -71,7 +71,7 @@ def fetch_rss(src):
     last_err = None
     for url in src["urls"]:
         try:
-            r = requests.get(url, headers=UA, timeout=20)
+            r = requests.get(url, headers=UA, timeout=45)
             r.raise_for_status()
             feed = feedparser.parse(r.content)
             if not feed.entries:
@@ -86,6 +86,46 @@ def fetch_rss(src):
         except Exception as ex:
             last_err = ex
     raise RuntimeError(f"все зеркала не ответили: {last_err}")
+
+
+def parse_x_html(html_text):
+    """Достаёт твиты из встроенной ленты профиля (__NEXT_DATA__)."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    tag = soup.find("script", id="__NEXT_DATA__")
+    if not tag:
+        raise RuntimeError("в ответе нет данных ленты")
+    data = json.loads(tag.string)
+    entries = data["props"]["pageProps"]["timeline"]["entries"]
+    posts = []
+    for e in entries:
+        if e.get("type") != "tweet":
+            continue
+        t = e["content"]["tweet"]
+        tid = t.get("id_str") or str(t.get("id"))
+        screen = (t.get("user") or {}).get("screen_name", "i")
+        text = t.get("full_text") or t.get("text") or ""
+        posts.append({"id": tid, "text": html.unescape(text).strip(),
+                      "url": f"https://x.com/{screen}/status/{tid}"})
+    posts.sort(key=lambda p: int(p["id"]))  # старые -> новые
+    return posts
+
+
+def fetch_x(src):
+    last_err = None
+    for host in ("syndication.twitter.com", "syndication.x.com"):
+        try:
+            r = requests.get(f"https://{host}/srv/timeline-profile/screen-name/{src['user']}",
+                             headers=UA, timeout=25)
+            r.raise_for_status()
+            posts = parse_x_html(r.text)
+            if posts:
+                return posts
+        except Exception as ex:
+            last_err = ex
+    try:  # запасной путь: Nitter
+        return fetch_rss(src)
+    except Exception as ex:
+        raise RuntimeError(f"Twitter недоступен ({last_err}; {ex})")
 
 
 def send(topic_key, name, post):
@@ -108,7 +148,7 @@ def main():
     for src in SOURCES:
         name = src["name"]
         try:
-            posts = fetch_tg(src) if src["type"] == "tg" else fetch_rss(src)
+            posts = {"tg": fetch_tg, "x": fetch_x}.get(src["type"], fetch_rss)(src)
         except Exception as ex:
             print(f"[{name}] ошибка: {ex}")
             continue
