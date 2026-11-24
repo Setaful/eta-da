@@ -68,13 +68,15 @@ def fetch_tg(src):
 
 
 def fetch_rss(src):
-    last_err = None
+    errors = []
     for url in src["urls"]:
+        host = url.split("/")[2]
         try:
             r = requests.get(url, headers=UA, timeout=45)
             r.raise_for_status()
             feed = feedparser.parse(r.content)
             if not feed.entries:
+                errors.append(f"{host}: лента пуста")
                 continue
             posts = []
             for e in feed.entries:
@@ -84,8 +86,8 @@ def fetch_rss(src):
             posts.reverse()  # RSS: новые сверху
             return posts
         except Exception as ex:
-            last_err = ex
-    raise RuntimeError(f"все зеркала не ответили: {last_err}")
+            errors.append(f"{host}: {str(ex)[:90]}")
+    raise RuntimeError("все зеркала не ответили -> " + " | ".join(errors))
 
 
 def parse_x_html(html_text):
@@ -120,6 +122,7 @@ def fetch_x(src):
             posts = parse_x_html(r.text)
             if posts:
                 return posts
+            last_err = f"{host}: лента пуста"
         except Exception as ex:
             last_err = ex
     try:  # запасной путь: Nitter
