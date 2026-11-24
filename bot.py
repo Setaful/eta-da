@@ -1,5 +1,5 @@
 """NTE news aggregator -> Telegram chat. Free: runs on GitHub Actions."""
-import os, json, html
+import os, json, html, time
 import requests, feedparser
 from bs4 import BeautifulSoup
 
@@ -20,7 +20,7 @@ TOPICS = {
 }
 
 # ---- Источники ----------------------------------------------------------
-NITTER = ["https://nitter.net", "https://nitter.poast.org", "https://nitter.privacydev.net"]
+NITTER = []  # зеркала Nitter мертвы, оставлено на случай если появятся живые
 RSSHUB = ["http://localhost:1200", "https://rsshub.app", "https://rsshub.rssforever.com"]  # localhost = свой RSSHub, поднимается в workflow
 
 SOURCES = []
@@ -73,7 +73,10 @@ def fetch_rss(src):
         host = url.split("/")[2]
         try:
             r = requests.get(url, headers=UA, timeout=45)
-            r.raise_for_status()
+            if not r.ok:
+                body = BeautifulSoup(r.text, "html.parser").get_text(" ", strip=True)[:300]
+                errors.append(f"{host}: HTTP {r.status_code}: {body}")
+                continue
             feed = feedparser.parse(r.content)
             if not feed.entries:
                 errors.append(f"{host}: лента пуста")
@@ -116,8 +119,11 @@ def fetch_x(src):
     last_err = None
     for host in ("syndication.twitter.com", "syndication.x.com"):
         try:
-            r = requests.get(f"https://{host}/srv/timeline-profile/screen-name/{src['user']}",
-                             headers=UA, timeout=25)
+            url = f"https://{host}/srv/timeline-profile/screen-name/{src['user']}"
+            r = requests.get(url, headers=UA, timeout=25)
+            if r.status_code == 429:  # лимит запросов: ждём и пробуем один раз ещё
+                time.sleep(15)
+                r = requests.get(url, headers=UA, timeout=25)
             r.raise_for_status()
             posts = parse_x_html(r.text)
             if posts:
@@ -125,6 +131,8 @@ def fetch_x(src):
             last_err = f"{host}: лента пуста"
         except Exception as ex:
             last_err = ex
+    if not src.get("urls"):
+        raise RuntimeError(f"Twitter недоступен ({last_err}). Следующая попытка при следующем запуске")
     try:  # запасной путь: Nitter
         return fetch_rss(src)
     except Exception as ex:
@@ -151,6 +159,8 @@ def main():
     for src in SOURCES:
         name = src["name"]
         try:
+            if src["type"] == "x":
+                time.sleep(5)
             posts = {"tg": fetch_tg, "x": fetch_x}.get(src["type"], fetch_rss)(src)
         except Exception as ex:
             print(f"[{name}] ошибка: {ex}")
