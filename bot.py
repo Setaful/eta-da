@@ -23,6 +23,11 @@ GROUP = os.environ.get("GROUP", "all")
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 BILI_COOKIE = os.environ.get("BILI_COOKIE", "")
 WEIBO_COOKIE = os.environ.get("WEIBO_COOKIE", "")
+# Как доставлять посты из Telegram-каналов:
+#   forward - настоящая пересылка (видно "Переслано из ...", всё как в оригинале)
+#   copy    - копия без пометки о пересылке (оригинальный текст, медиа и форматирование)
+#   text    - старый способ: текст и ссылка
+TG_MODE = os.environ.get("TG_MODE", "forward")
 X_EVERY = int(os.environ.get("X_EVERY", "3"))  # Twitter проверять раз в N запусков (по умолчанию каждые ~30 мин)
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
 MOBILE_UA = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1"}
@@ -273,6 +278,29 @@ def send(topic_key, name, post):
         print("send error:", r.text)
 
 
+def deliver_tg(src, posts):
+    """Пересылает/копирует посты канала целиком (альбомы остаются вместе)."""
+    method = "forwardMessages" if TG_MODE == "forward" else "copyMessages"
+    thread = TOPICS.get(src["topic"])
+    for i in range(0, len(posts), 100):
+        chunk = posts[i:i + 100]
+        ids = [int(p["id"].split("/")[1]) for p in chunk]
+        data = {"chat_id": CHAT_ID, "from_chat_id": "@" + src["channel"],
+                "message_ids": json.dumps(ids)}
+        if thread:
+            data["message_thread_id"] = thread
+        r = requests.post(f"https://api.telegram.org/bot{TOKEN}/{method}", data=data, timeout=30)
+        if r.status_code == 429:  # лимит Telegram: ждём и пробуем ещё раз
+            wait = r.json().get("parameters", {}).get("retry_after", 10)
+            time.sleep(min(wait + 1, 60))
+            r = requests.post(f"https://api.telegram.org/bot{TOKEN}/{method}", data=data, timeout=30)
+        if not r.ok:
+            print(f"[{src['name']}] {method} не удался ({r.text[:150]}), отправляю текстом")
+            for p in chunk:
+                send(src["topic"], src["name"], p)
+        time.sleep(1)
+
+
 def main():
     try:
         state = json.load(open(STATE_FILE, encoding="utf-8"))
@@ -295,10 +323,14 @@ def main():
         if seen is None:  # первый запуск: просто запоминаем, не спамим
             state[name] = [p["id"] for p in posts][-100:]
             continue
-        for p in posts:
-            if p["id"] not in seen:
-                send(src["topic"], name, p)
-                seen.append(p["id"])
+        new = [p for p in posts if p["id"] not in seen]
+        if new:
+            if src["type"] == "tg" and TG_MODE in ("forward", "copy"):
+                deliver_tg(src, new)
+            else:
+                for p in new:
+                    send(src["topic"], name, p)
+            seen.extend(p["id"] for p in new)
         state[name] = seen[-100:]
 
     json.dump(state, open(STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
