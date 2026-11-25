@@ -22,6 +22,8 @@ CHAT_ID = os.environ["CHAT_ID"]
 GROUP = os.environ.get("GROUP", "all")
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 BILI_COOKIE = os.environ.get("BILI_COOKIE", "")
+WEIBO_COOKIE = os.environ.get("WEIBO_COOKIE", "")
+X_EVERY = int(os.environ.get("X_EVERY", "3"))  # Twitter проверять раз в N запусков (по умолчанию каждые ~30 мин)
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
 MOBILE_UA = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1"}
 
@@ -57,7 +59,8 @@ SOURCES.append({"name": "Weibo", "topic": "weibo", "type": "weibo", "uid": WEIBO
 
 TG_CHANNELS = ["NTEanabioz", "NTE_Pokoii", "NTEDARK", "Info_Neverness_to_Everness",
                "Neverness_to_EvernessRU", "kvashnya5", "MIU_VERSE", "Neverness_to_Everness_RU",
-               "NTENews", "Nevernesstoeverness_leaks", "NevernessToEverness", "hotori_nte", "ntenewsru"]
+               "NTENews", "Nevernesstoeverness_leaks", "NevernessToEverness", "hotori_nte", "ntenewsru",
+               "kjwqofekj"]
 TG_LEAKS = ["nte_blednaya", "Seele_NTE_Leaks"]
 
 for c in TG_CHANNELS:
@@ -145,8 +148,8 @@ def fetch_x(src):
             url = f"https://{host}/srv/timeline-profile/screen-name/{src['user']}"
             r = requests.get(url, headers=UA, timeout=25)
             if r.status_code == 429:
-                time.sleep(15)
-                r = requests.get(url, headers=UA, timeout=25)
+                last_err = "лимит запросов Twitter (429), попробую позже"
+                break
             r.raise_for_status()
             posts = parse_x_html(r.text)
             if posts:
@@ -176,24 +179,36 @@ def parse_bili(j):
     return posts
 
 
+def snippet(r):
+    return f"HTTP {r.status_code}, ответ: {r.text[:120]!r}"
+
+
 def fetch_bili(src):
     headers = dict(UA, Referer="https://space.bilibili.com/")
     if BILI_COOKIE:
         headers["Cookie"] = BILI_COOKIE
     err = None
     try:
-        r = requests.get("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
-                         params={"host_mid": src["uid"]}, headers=headers, timeout=25)
-        j = r.json()
+        s = requests.Session()
+        if not BILI_COOKIE:
+            s.get("https://www.bilibili.com/", headers=UA, timeout=20)  # получаем базовые cookie
+        r = s.get("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
+                  params={"host_mid": src["uid"]}, headers=headers, timeout=25)
+        try:
+            j = r.json()
+        except ValueError:
+            raise RuntimeError(snippet(r) + ("" if BILI_COOKIE else " (скорее всего нужен BILI_COOKIE в local.env)"))
         if j.get("code") == 0:
             return parse_bili(j)
         err = f"Bilibili API: код {j.get('code')}, {j.get('message')}"
+        if not BILI_COOKIE:
+            err += " (нужен BILI_COOKIE в local.env)"
     except Exception as ex:
-        err = f"Bilibili API: {str(ex)[:120]}"
+        err = f"Bilibili API: {str(ex)[:200]}"
     try:
         return fetch_rss(src)
     except Exception as ex:
-        raise RuntimeError(f"{err} | RSSHub: {str(ex)[:150]}")
+        raise RuntimeError(f"{err} | RSSHub: {str(ex)[:80]}")
 
 
 # --- Weibo ---
@@ -214,23 +229,34 @@ def fetch_weibo(src):
     uid = src["uid"]
     err = None
     try:
-        r = requests.get("https://m.weibo.cn/api/container/getIndex",
-                         params={"type": "uid", "value": uid, "containerid": f"107603{uid}"},
-                         headers=dict(MOBILE_UA, Referer=f"https://m.weibo.cn/u/{uid}"), timeout=25)
-        j = r.json()
+        s = requests.Session()
+        if not WEIBO_COOKIE:
+            s.get("https://m.weibo.cn/", headers=MOBILE_UA, timeout=20)  # cookie гостя
+        headers = dict(MOBILE_UA, Referer=f"https://m.weibo.cn/u/{uid}",
+                       **{"X-Requested-With": "XMLHttpRequest", "MWeibo-Pwa": "1"})
+        if WEIBO_COOKIE:
+            headers["Cookie"] = WEIBO_COOKIE
+        r = s.get("https://m.weibo.cn/api/container/getIndex",
+                  params={"type": "uid", "value": uid, "containerid": f"107603{uid}"},
+                  headers=headers, timeout=25)
+        try:
+            j = r.json()
+        except ValueError:
+            raise RuntimeError(snippet(r))
         if j.get("ok") == 1:
             posts = parse_weibo(j)
             if posts:
                 return posts
             err = "Weibo API: записей нет"
         else:
-            err = f"Weibo API: ok={j.get('ok')}, {j.get('msg', '')}"
+            err = f"Weibo API: ok={j.get('ok')}, {j.get('msg', '')}" + (
+                " (нужен WEIBO_COOKIE в local.env)" if j.get("ok") == -100 and not WEIBO_COOKIE else "")
     except Exception as ex:
-        err = f"Weibo API: {str(ex)[:120]}"
+        err = f"Weibo API: {str(ex)[:200]}"
     try:
         return fetch_rss(src)
     except Exception as ex:
-        raise RuntimeError(f"{err} | RSSHub: {str(ex)[:150]}")
+        raise RuntimeError(f"{err} | RSSHub: {str(ex)[:80]}")
 
 
 FETCHERS = {"tg": fetch_tg, "x": fetch_x, "bili": fetch_bili, "weibo": fetch_weibo, "rss": fetch_rss}
@@ -257,6 +283,8 @@ def main():
         name = src["name"]
         try:
             if src["type"] == "x":
+                if int(time.time() // 600) % X_EVERY != 0:
+                    continue  # Twitter проверяем реже, чтобы не ловить лимит
                 time.sleep(5)
             posts = FETCHERS[src["type"]](src)
         except Exception as ex:
